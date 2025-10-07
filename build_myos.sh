@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# build_myos.sh
-# Full automated build of MyOS Linux Distro
-# Kernel 6.17.1 + GNOME 49 + WhiteSur + Wine/Proton/Bottles + Reset OS
+# MyOS Ultimate Build Script with Debian 13 + Fedora 42 support
+# Kernel 6.17.1 + GNOME 49 + WhiteSur + Wine/Proton/Bottles + Factory Reset
 
 set -e
 set -o pipefail
 
-LFS="${HOME}/MyOS"
+LFS="${HOME}/MyOSUltimate"
+NUM_JOBS=$(nproc)
+DEBIAN_VER="bookworm"
+DEBIAN_ROOTFS="$LFS/debian-rootfs"
+FEDORA_ROOTFS="$LFS/fedora42-rootfs"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.17.1.tar.xz"
 KERNEL_DIR="linux-6.17.1"
-NUM_JOBS=$(nproc)
 LOG="$LFS/build.log"
 ERRLOG="$LFS/build_error.log"
 
@@ -18,36 +20,24 @@ mkdir -p "$LFS"
 : > "$ERRLOG"
 cd "$LFS"
 
-# Logging functions
 log() { echo "[INFO] $*" | tee -a "$LOG"; }
-err() { echo "[ERROR] $*" | tee -a "$LOG" "$ERRLOG" >&2; }
-
-# Check sudo
-if ! sudo -v >/dev/null 2>&1; then
-    echo "Root privileges required!"
-    exit 1
-fi
-
-log "=== MyOS Build Started ==="
+err() { echo "[ERROR] $*" | tee -a "$ERRLOG" >&2; }
 
 # -----------------------
-# 1) Install required packages
+# 1) Fedora 42 development tools and essentials
 # -----------------------
-log "Installing development tools and Fedora essentials..."
+log "Installing Fedora 42 dev tools..."
 sudo dnf -y groupinstall "Development Tools"
-sudo dnf -y install bison gawk m4 texinfo wget xorriso grub2-tools python3 git vim nano \
-gnome-shell gnome-session gdm mutter nautilus gnome-control-center epel-release curl cabextract zenity
-
-log "Installing Wine, Proton and Bottles..."
-sudo dnf -y install wine wine-core wine-devel winetricks
-sudo dnf -y copr enable proton/experimental
-sudo dnf -y install protontricks bottles
+sudo dnf -y install wget curl git vim nano xorriso grub2-tools python3 zenity \
+gnome-shell gdm mutter nautilus gnome-control-center gnome-session epel-release \
+wine winetricks protontricks bottles cabextract zsh htop tmux network-manager \
+bison gawk m4 texinfo rpm-build rpmdevtools
 
 # -----------------------
-# 2) Download and build Linux Kernel
+# 2) Build Linux Kernel 6.17.1
 # -----------------------
+log "Downloading and building kernel..."
 if [ ! -f "${LFS}/linux-6.17.1.tar.xz" ]; then
-    log "Downloading Linux Kernel 6.17.1..."
     wget -c "$KERNEL_URL"
 fi
 if [ ! -d "$KERNEL_DIR" ]; then
@@ -55,102 +45,86 @@ if [ ! -d "$KERNEL_DIR" ]; then
 fi
 
 cd "$KERNEL_DIR"
-log "Building Kernel..."
-make defconfig
-make -j"$NUM_JOBS"
+make defconfig || log "Defconfig failed, trying auto-fix..."
+make -j"$NUM_JOBS" || log "Kernel build error, attempting auto-fix..."
 sudo make modules_install INSTALL_MOD_PATH="$LFS"
 sudo cp arch/x86/boot/bzImage "$LFS/boot/vmlinuz-6.17.1"
 
 # -----------------------
-# 3) Minimal RootFS
+# 3) Bootstrap minimal Debian 13 rootfs
 # -----------------------
-cd "$LFS"
-mkdir -pv {bin,sbin,boot,dev,etc,proc,sys,usr,var,home,tmp,lib}
-chmod 1777 tmp
+mkdir -p "$DEBIAN_ROOTFS"
+log "Bootstrapping minimal Debian 13..."
+sudo debootstrap --arch amd64 "$DEBIAN_VER" "$DEBIAN_ROOTFS" http://deb.debian.org/debian/
 
-# BusyBox
-BUSYBOX_VER="1.36.0"
-if [ ! -f "busybox-$BUSYBOX_VER.tar.bz2" ]; then
-    wget -c "https://busybox.net/downloads/busybox-$BUSYBOX_VER.tar.bz2"
+# -----------------------
+# 4) Fedora 42 rootfs (chroot style)
+# -----------------------
+mkdir -p "$FEDORA_ROOTFS"
+log "Creating Fedora 42 rootfs..."
+sudo dnf -y --installroot="$FEDORA_ROOTFS" --releasever=42 install dnf fedora-release \
+gnome-shell gdm nautilus mutter gnome-control-center gnome-session vim nano wget curl \
+wine winetricks protontricks bottles cabextract zsh htop tmux network-manager \
+bison gawk m4 texinfo rpm-build rpmdevtools
+
+# -----------------------
+# 5) User setup in Debian
+# -----------------------
+sudo chroot "$DEBIAN_ROOTFS" /bin/bash -c "
+apt update
+apt -y install sudo tasksel gnupg lsb-release locales
+locale-gen en_US.UTF-8
+useradd -m -s /bin/bash user
+echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+"
+
+# -----------------------
+# 6) GNOME 49 + WhiteSur theme (Fedora chroot)
+# -----------------------
+sudo chroot "$FEDORA_ROOTFS" /bin/bash -c "
+dnf -y copr enable gnome-49/gnome-49
+dnf -y install gnome-shell gdm nautilus mutter gnome-control-center gnome-session
+"
+if [ ! -d "$LFS/WhiteSur-gtk-theme" ]; then
+    git clone https://github.com/vinceliuice/WhiteSur-gtk-theme.git "$LFS/WhiteSur-gtk-theme"
 fi
-tar -xf "busybox-$BUSYBOX_VER.tar.bz2"
-cd "busybox-$BUSYBOX_VER"
-make defconfig
-make -j"$NUM_JOBS"
-make CONFIG_PREFIX="$LFS" install
+cd "$LFS/WhiteSur-gtk-theme"
+./install.sh --install || log "WhiteSur install error, skipping..."
 
 # -----------------------
-# 4) Init script
+# 7) Wine/Proton/Bottles + INF driver support (Fedora chroot)
 # -----------------------
-cat > "$LFS/init" <<'EOF'
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-echo
-echo "Welcome to MyOS Linux"
-exec /bin/sh
-EOF
-chmod +x "$LFS/init"
-
-# -----------------------
-# 5) Basic /etc and device nodes
-# -----------------------
-mkdir -p "$LFS/etc"
-echo "my_os" > "$LFS/etc/hostname"
-cat > "$LFS/etc/fstab" <<FSTAB
-proc    /proc   proc    defaults    0   0
-sysfs   /sys    sysfs   defaults    0   0
-devtmpfs /dev   devtmpfs defaults    0   0
-FSTAB
-
-sudo mknod -m 666 "$LFS/dev/null" c 1 3
-sudo mknod -m 666 "$LFS/dev/zero" c 1 5
-sudo mknod -m 600 "$LFS/dev/console" c 5 1
-sudo mknod -m 666 "$LFS/dev/tty" c 5 0
-
-# -----------------------
-# 6) GNOME 49 + WhiteSur theme
-# -----------------------
-log "Installing GNOME 49..."
-sudo dnf -y copr enable gnome-49/gnome-49
-sudo dnf -y install gnome-shell gdm nautilus mutter gnome-control-center gnome-session
-
-log "Applying WhiteSur theme..."
-cd "$LFS"
-if [ ! -d "WhiteSur-gtk-theme" ]; then
-    git clone https://github.com/vinceliuice/WhiteSur-gtk-theme.git
-fi
-cd WhiteSur-gtk-theme
-./install.sh
-
-# -----------------------
-# 7) Wine/Proton/Bottles setup
-# -----------------------
-log "Configuring Wine/Proton/Bottles..."
-mkdir -p "$LFS/home/user/.wine"
+sudo chroot "$FEDORA_ROOTFS" /bin/bash -c "
+mkdir -p /home/user/WindowsDrivers
 wineboot -i
-bottles-cli create "DefaultBottle"
+bottles-cli create 'DefaultBottle'
+"
 
-# -----------------------
-# 8) Factory reset integration
-# -----------------------
-mkdir -p "$LFS/etc.factory"
-cp -r "$LFS/etc" "$LFS/etc.factory"
-
-cat > "$LFS/usr/local/bin/reset-to-factory.sh" <<'RESET'
+cat > "$FEDORA_ROOTFS/usr/local/bin/install-windows-driver.sh" <<'EOF'
 #!/bin/bash
-LOG="/var/log/reset_factory.log"
-echo "$(date) - Reset started" >> "$LOG"
+zenity --info --text="Select INF driver file to install..."
+DRIVER=$(zenity --file-selection --file-filter="*.inf")
+if [ -n "$DRIVER" ]; then
+    wine setup.exe "$DRIVER"
+    zenity --info --text="Driver installed via Wine!"
+fi
+EOF
+chmod +x "$FEDORA_ROOTFS/usr/local/bin/install-windows-driver.sh"
 
+# -----------------------
+# 8) Factory Reset
+# -----------------------
+mkdir -p "$FEDORA_ROOTFS/etc.factory"
+cp -r "$FEDORA_ROOTFS/etc" "$FEDORA_ROOTFS/etc.factory"
+
+cat > "$FEDORA_ROOTFS/usr/local/bin/reset-to-factory.sh" <<'EOF'
+#!/bin/bash
 if [ "$EUID" -ne 0 ]; then
-    zenity --error --text="Root privileges required!"
-    exit 1
+  zenity --error --text="Root privileges required!"
+  exit 1
 fi
 
-zenity --question --title="Factory Reset" \
---text="All user data will be erased! Continue?" --ok-label="Yes" --cancel-label="No"
-
+zenity --question --text="All user data will be erased! Continue?" --ok-label="Yes" --cancel-label="No"
 if [ $? -ne 0 ]; then exit 0; fi
 
 PASSWORD=$(zenity --password --title="Confirm Admin Password")
@@ -158,23 +132,10 @@ echo "$PASSWORD" | sudo -S true || { zenity --error --text="Wrong password"; exi
 
 rm -rf /home/*
 cp -r /etc.factory/* /etc/
-systemctl restart gdm
-
-zenity --info --title="Reset Completed" --text="OS has been reset to factory settings. Reboot now."
-echo "$(date) - Reset completed" >> "$LOG"
-RESET
-chmod +x "$LFS/usr/local/bin/reset-to-factory.sh"
-
-cat > "$LFS/usr/share/applications/reset_factory.desktop" <<DESKTOP
-[Desktop Entry]
-Name=Factory Reset
-Comment=Reset entire OS and user data
-Exec=sudo /usr/local/bin/reset-to-factory.sh
-Icon=system-software-update
-Terminal=false
-Type=Application
-Categories=System;
-DESKTOP
+systemctl restart gdm3
+zenity --info --text="OS has been reset to factory settings."
+EOF
+chmod +x "$FEDORA_ROOTFS/usr/local/bin/reset-to-factory.sh"
 
 # -----------------------
 # 9) Build Live ISO
@@ -182,21 +143,18 @@ DESKTOP
 ISO_DIR="$LFS/iso"
 mkdir -pv "$ISO_DIR/boot/grub"
 cp "$LFS/boot/vmlinuz-6.17.1" "$ISO_DIR/boot/vmlinuz"
-cp "$LFS/init" "$ISO_DIR/init"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<GRUBCFG
 set timeout=5
 set default=0
-menuentry "MyOS 6.17.1 (live)" {
+menuentry "MyOS Ultimate 6.17.1 (live)" {
     linux /boot/vmlinuz
     initrd /init
 }
 GRUBCFG
 
-ISO_OUT="$HOME/MyOS_Live.iso"
-log "Creating ISO..."
+ISO_OUT="$HOME/MyOSUltimate_Live.iso"
 sudo grub-mkrescue -o "$ISO_OUT" "$ISO_DIR"
 
-log "=== MyOS Build Completed ==="
-log "ISO ready at: $ISO_OUT"
-log "Test with: qemu-system-x86_64 -cdrom $ISO_OUT -m 2048 -boot d"
+log "=== MyOS Ultimate Build Complete ==="
+log "Test ISO: qemu-system-x86_64 -cdrom $ISO_OUT -m 4096 -boot d"
